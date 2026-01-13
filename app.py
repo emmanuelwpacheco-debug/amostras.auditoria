@@ -1,33 +1,107 @@
-import streamlit as st
 import pandas as pd
 import geopandas as gpd
 import numpy as np
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString
+from google.colab import files
 import fiona
 import random
 import io
 
-# Configurações iniciais
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 
-st.set_page_config(page_title="Auditoria de Obras", layout="wide")
+def processar_auditoria_v7():
+    print("1. SELECIONE O ARQUIVO KML DA RODOVIA")
+    uploaded = files.upload()
+    if not uploaded: return
+    kml_path = list(uploaded.keys())[0]
 
-st.title("🚧 Auditoria Rodoviária: Amostragem Aleatória")
-st.markdown("Selecione o arquivo KML e defina os parâmetros para gerar os pontos de extração.")
+    print("\n2. PARÂMETROS TÉCNICOS")
+    largura_pista = float(input("Largura da pista (m): "))
+    area_min_amostra = float(input("Área mínima por amostra (m²): "))
+    qtd_desejada = int(input("Quantidade de amostras pretendida: "))
+    dist_min_entre_pontos = float(input("Distância mínima entre amostras (m): "))
+    recuo_curva = 130.0 
 
-# --- BARRA LATERAL ---
-st.sidebar.header("Configurações de Campo")
-uploaded_file = st.sidebar.file_uploader("Upload do KML da Rodovia", type=['kml'])
-largura = st.sidebar.number_input("Largura da pista (m)", value=7.0, step=0.5)
-area_min = st.sidebar.number_input("Área mínima por amostra (m²)", value=3000.0, step=100.0)
-qtd_desejada = st.sidebar.number_input("Quantidade mínima de amostras", value=5, step=1)
-dist_min_entre_pontos = st.sidebar.number_input("Distância mínima entre amostras (m)", value=150.0)
-recuo_curva = 130.0
+    # 3. Processamento Geográfico
+    gdf = gpd.read_file(kml_path, driver='KML')
+    utm_gdf = gdf.to_crs(gdf.estimate_utm_crs())
+    linha_rodovia = utm_gdf.geometry.iloc[0]
+    extensao_metros = linha_rodovia.length
+    
+    zonas_proibidas = identificar_zonas_curvas(linha_rodovia, recuo_curva)
 
-# --- FUNÇÕES DE APOIO ---
-def identificar_zonas_curvas(linha, recuo):
+    # 4. Memorial de Cálculo
+    area_total = extensao_metros * largura_pista
+    qtd_minima_normativa = int(np.ceil(area_total / area_min_amostra))
+    qtd_final = max(qtd_desejada, qtd_minima_normativa)
+
+    # 5. Algoritmo de Alocação
+    amostras_temp = []
+    tentativas = 0
+    while len(amostras_temp) < qtd_final and tentativas < 40000:
+        dist_aleatoria = random.uniform(0, extensao_metros)
+        if not esta_em_zona_proibida(dist_aleatoria, zonas_proibidas):
+            if all(abs(dist_aleatoria - a['dist']) >= dist_min_entre_pontos for a in amostras_temp):
+                amostras_temp.append({'dist': dist_aleatoria})
+        tentativas += 1
+
+    # ORDENAÇÃO E ATRIBUIÇÃO DE BORDOS
+    amostras_temp.sort(key=lambda x: x['dist'])
+    sequencia_bordos = ["BD", "EIXO", "BE"]
+    
+    dados_finais = []
+    for i, amos in enumerate(amostras_temp):
+        bordo = sequencia_bordos[i % 3]
+        offset = (largura_pista / 2) if bordo == "BD" else (-largura_pista / 2 if bordo == "BE" else 0)
+        
+        ponto_geom = gerar_ponto_com_offset(linha_rodovia, amos['dist'], offset)
+        
+        # Coordenadas Geográficas para a tabela
+        ponto_wgs84 = gpd.GeoSeries([ponto_geom], crs=utm_gdf.crs).to_crs(epsg=4326)[0]
+        
+        dados_finais.append({
+            'Amostra': i + 1,
+            'Identificação': f"Amostra {i+1:02d}",
+            'Posição': bordo,
+            'Estaca (m)': round(amos['dist'], 2),
+            'Quilometragem': f"{(amos['dist']/1000):.3f}",
+            'Latitude': ponto_wgs84.y,
+            'Longitude': ponto_wgs84.x
+        })
+
+    # 6. Geração de Resultados
+    df_resultados = pd.DataFrame(dados_finais)
+    
+    # Exibição da Tabela
+    print("\n" + "="*80)
+    print("PLANILHA DE AMOSTRAGEM GERADA")
+    print(df_resultados.to_string(index=False))
+    print("="*80)
+
+    # Exportação para EXCEL
+    excel_name = "relatorio_amostragem.xlsx"
+    df_resultados.to_excel(excel_name, index=False)
+    
+    # Exportação para KML
+    amostras_gdf = gpd.GeoDataFrame(df_resultados, 
+                                     geometry=[Point(lon, lat) for lon, lat in zip(df_resultados['Longitude'], df_resultados['Latitude'])], 
+                                     crs="EPSG:4326")
+    
+    amostras_gdf['Name'] = amostras_gdf['Identificação'] + " - " + amostras_gdf['Posição'] + " (km " + amostras_gdf['Quilometragem'] + ")"
+    amostras_gdf['Description'] = "Posição lateral: " + amostras_gdf['Posição']
+    
+    kml_name = "amostras_auditoria.kml"
+    amostras_gdf[['Name', 'Description', 'geometry']].to_file(kml_name, driver='KML')
+    
+    # Download dos arquivos
+    print(f"\nDownload concluído: {excel_name} e {kml_name}")
+    files.download(excel_name)
+    files.download(kml_name)
+
+# --- FUNÇÕES AUXILIARES ---
+
+def identificar_zonas_curvas(linha, recuo, passo=10):
     zonas = []
-    passo = 10
     for d in range(passo, int(linha.length) - passo, passo):
         p1, p2, p3 = linha.interpolate(d-passo), linha.interpolate(d), linha.interpolate(d+passo)
         v1 = np.array([p2.x-p1.x, p2.y-p1.y])
@@ -37,59 +111,16 @@ def identificar_zonas_curvas(linha, recuo):
             zonas.append((d - recuo, d + recuo))
     return zonas
 
-# --- PROCESSAMENTO ---
-if uploaded_file:
-    # Leitura do arquivo
-    gdf = gpd.read_file(uploaded_file, driver='KML')
-    utm_gdf = gdf.to_crs(gdf.estimate_utm_crs())
-    linha_rodovia = utm_gdf.geometry.iloc[0]
-    extensao = linha_rodovia.length
-    
-    # Memorial de Cálculo
-    area_total = extensao * largura
-    n_minimo = int(np.ceil(area_total / area_min))
-    n_final = max(qtd_desejada, n_minimo)
-    
-    st.info(f"**Memorial de Cálculo:** Extensão de {extensao:.2f}m | Área Total: {area_total:.2f}m² | Mínimo Normativo: {n_minimo} amostras.")
+def esta_em_zona_proibida(dist, zonas):
+    for inicio, fim in zonas:
+        if inicio <= dist <= fim: return True
+    return False
 
-    if st.button("Gerar Amostras Seguras"):
-        zonas_proibidas = identificar_zonas_curvas(linha_rodovia, recuo_curva)
-        amostras_temp = []
-        tentativas = 0
-        
-        with st.spinner('Calculando pontos em trechos de reta...'):
-            while len(amostras_temp) < n_final and tentativas < 20000:
-                dist = random.uniform(0, extensao)
-                esta_proibido = any(i <= dist <= f for i, f in zonas_proibidas)
-                
-                if not esta_proibido:
-                    offset = random.uniform(-(largura/2), (largura/2))
-                    p1, p2 = linha_rodovia.interpolate(dist), linha_rodovia.interpolate(dist + 0.5)
-                    dx, dy = p2.x - p1.x, p2.y - p1.y
-                    mag = np.sqrt(dx**2 + dy**2)
-                    ponto = Point(p1.x - dy/mag * offset, p1.y + dx/mag * offset)
-                    
-                    if all(ponto.distance(prev['geom']) >= dist_min_entre_pontos for prev in amostras_temp):
-                        amostras_temp.append({'geom': ponto, 'dist': dist})
-                tentativas += 1
+def gerar_ponto_com_offset(linha, dist, offset):
+    p1, p2 = linha.interpolate(dist), linha.interpolate(dist + 0.5)
+    dx, dy = p2.x - p1.x, p2.y - p1.y
+    mag = np.sqrt(dx**2 + dy**2)
+    nx, ny = -dy/mag, dx/mag
+    return Point(p1.x + nx * offset, p1.y + ny * offset)
 
-        # Ordenação e Finalização
-        amostras_temp.sort(key=lambda x: x['dist'])
-        
-        # Criar GeoDataFrame
-        final_gdf = gpd.GeoDataFrame({
-            'Name': [f"Amostra {i+1:02d} (km {a['dist']/1000:.3f})" for i, a in enumerate(amostras_temp)],
-            'KM': [a['dist'] for a in amostras_temp]
-        }, geometry=[a['geom'] for a in amostras_temp], crs=utm_gdf.crs).to_crs(epsg=4326)
-
-        # Download
-        buffer = io.BytesIO()
-        final_gdf.to_file(buffer, driver='KML')
-        st.success(f"Foram geradas {len(amostras_temp)} amostras sequenciais!")
-        st.download_button(label="📥 Baixar KML das Amostras", data=buffer.getvalue(), file_name="amostras_auditoria.kml", mime="application/vnd.google-earth.kml+xml")
-        
-        # Mostrar tabela
-        st.table(pd.DataFrame({
-            'Identificação': [f"Amostra {i+1:02d}" for i in range(len(amostras_temp))],
-            'KM (m)': [f"{a['dist']:.2f}" for a in amostras_temp]
-        }))
+processar_auditoria_v7()
