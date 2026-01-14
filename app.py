@@ -35,68 +35,83 @@ def identificar_zonas_curvas(linha, recuo=130):
             zonas.append((d - recuo, d + recuo))
     return zonas
 
+# --- LÓGICA DE GERAÇÃO ---
 if uploaded_file:
-    gdf = gpd.read_file(uploaded_file, driver='KML')
-    utm_gdf = gdf.to_crs(gdf.estimate_utm_crs())
-    linha_rodovia = utm_gdf.geometry.iloc[0]
-    extensao = linha_rodovia.length
-    
-    # Cálculo da quantidade
-    n_minimo = int(np.ceil((extensao * largura) / area_min))
-    n_final = max(qtd_desejada, n_minimo)
+    # Se o arquivo mudar, limpamos a memória anterior
+    if 'last_uploaded' not in st.session_state or st.session_state['last_uploaded'] != uploaded_file.name:
+        st.session_state['amostras'] = None
+        st.session_state['last_uploaded'] = uploaded_file.name
 
     if st.sidebar.button("Gerar Amostras"):
-        zonas_proibidas = identificar_zonas_curvas(linha_rodovia)
-        amostras_temp = []
-        tentativas = 0
-        
-        while len(amostras_temp) < n_final and tentativas < 50000:
-            dist = random.uniform(0, extensao)
-            esta_proibido = any(i <= dist <= f for i, f in zonas_proibidas)
-            if not esta_proibido:
-                if all(abs(dist - a['dist']) >= dist_min for a in amostras_temp):
-                    amostras_temp.append({'dist': dist})
-            tentativas += 1
-
-        amostras_temp.sort(key=lambda x: x['dist'])
-        sequencia_bordos = ["Bordo Direito", "Eixo", "Bordo Esquerdo"]
-        dados_finais = []
-        
-        for i, amos in enumerate(amostras_temp):
-            bordo = sequencia_bordos[i % 3]
-            offset = (largura/2) if bordo == "Bordo Direito" else (-(largura/2) if bordo == "Bordo Esquerdo" else 0)
-            p1, p2 = linha_rodovia.interpolate(amos['dist']), linha_rodovia.interpolate(amos['dist'] + 0.1)
-            mag = np.sqrt((p2.x - p1.x)**2 + (p2.y - p1.y)**2)
-            ponto_geom = Point(p1.x - (p2.y - p1.y)/mag * offset, p1.y + (p2.x - p1.x)/mag * offset)
-            ponto_wgs84 = gpd.GeoSeries([ponto_geom], crs=utm_gdf.crs).to_crs(epsg=4326)[0]
+        with st.spinner('Processando geometria e sorteando pontos...'):
+            gdf = gpd.read_file(uploaded_file, driver='KML')
+            utm_gdf = gdf.to_crs(gdf.estimate_utm_crs())
+            linha_rodovia = utm_gdf.geometry.iloc[0]
+            extensao = linha_rodovia.length
             
-            dados_finais.append({
-                'Amostra': i + 1, 'Identificação': f"Amostra {i+1:02d}",
-                'Posição Lateral': bordo, 'Quilometragem': f"km {amos['dist']/1000:.3f}",
-                'Latitude': ponto_wgs84.y, 'Longitude': ponto_wgs84.x, 'geometry': ponto_geom
-            })
+            n_minimo = int(np.ceil((extensao * largura) / area_min))
+            n_final = max(qtd_desejada, n_minimo)
 
-        df_final = pd.DataFrame(dados_finais)
+            zonas_proibidas = identificar_zonas_curvas(linha_rodovia)
+            amostras_temp = []
+            tentativas = 0
+            
+            while len(amostras_temp) < n_final and tentativas < 50000:
+                dist = random.uniform(0, extensao)
+                esta_proibido = any(i <= dist <= f for i, f in zonas_proibidas)
+                if not esta_proibido:
+                    if all(abs(dist - a['dist']) >= dist_min for a in amostras_temp):
+                        amostras_temp.append({'dist': dist})
+                tentativas += 1
+
+            amostras_temp.sort(key=lambda x: x['dist'])
+            sequencia_bordos = ["Bordo Direito", "Eixo", "Bordo Esquerdo"]
+            dados_finais = []
+            
+            for i, amos in enumerate(amostras_temp):
+                bordo = sequencia_bordos[i % 3]
+                offset = (largura/2) if bordo == "Bordo Direito" else (-(largura/2) if bordo == "Bordo Esquerdo" else 0)
+                p1, p2 = linha_rodovia.interpolate(amos['dist']), linha_rodovia.interpolate(amos['dist'] + 0.1)
+                mag = np.sqrt((p2.x - p1.x)**2 + (p2.y - p1.y)**2)
+                ponto_geom = Point(p1.x - (p2.y - p1.y)/mag * offset, p1.y + (p2.x - p1.x)/mag * offset)
+                ponto_wgs84 = gpd.GeoSeries([ponto_geom], crs=utm_gdf.crs).to_crs(epsg=4326)[0]
+                
+                dados_finais.append({
+                    'Amostra': i + 1, 'Identificação': f"Amostra {i+1:02d}",
+                    'Posição Lateral': bordo, 'Quilometragem': f"km {amos['dist']/1000:.3f}",
+                    'Latitude': ponto_wgs84.y, 'Longitude': ponto_wgs84.x, 
+                    'geometry': ponto_geom, 'crs_origem': utm_gdf.crs.to_string()
+                })
+
+            st.session_state['amostras'] = pd.DataFrame(dados_finais)
+
+    # --- EXIBIÇÃO PERSISTENTE ---
+    if st.session_state.get('amostras') is not None:
+        df_final = st.session_state['amostras']
+        
         st.success(f"Foram geradas {len(df_final)} amostras.")
-        st.dataframe(df_final.drop(columns=['geometry']), use_container_width=True)
+        st.dataframe(df_final.drop(columns=['geometry', 'crs_origem']), use_container_width=True)
 
         col1, col2 = st.columns(2)
 
-        # Download KML (Prioridade)
+        # Download KML
         try:
-            amostras_gdf = gpd.GeoDataFrame(df_final, geometry='geometry', crs=utm_gdf.crs).to_crs(epsg=4326)
+            # Reconstroi o GeoDataFrame a partir da memória
+            crs_origem = df_final['crs_origem'].iloc[0]
+            amostras_gdf = gpd.GeoDataFrame(df_final, geometry='geometry', crs=crs_origem).to_crs(epsg=4326)
             amostras_gdf['Name'] = amostras_gdf['Identificação'] + " - " + amostras_gdf['Posição Lateral']
+            
             buffer_kml = io.BytesIO()
             amostras_gdf[['Name', 'geometry']].to_file(buffer_kml, driver='KML')
-            col1.download_button("📥 Baixar KML", buffer_kml.getvalue(), "amostras.kml")
+            col1.download_button("📥 Baixar KML", buffer_kml.getvalue(), "amostras.kml", key="kml_btn")
         except Exception as e:
-            st.error(f"Erro ao gerar KML: {e}")
+            col1.error(f"Erro no KML: {e}")
 
         # Download Excel
         try:
             buffer_excel = io.BytesIO()
-            df_final.drop(columns=['geometry']).to_excel(buffer_excel, index=False, engine='openpyxl')
-            col2.download_button("📥 Baixar Excel", buffer_excel.getvalue(), "amostras.xlsx")
+            with pd.ExcelWriter(buffer_excel, engine='openpyxl') as writer:
+                df_final.drop(columns=['geometry', 'crs_origem']).to_excel(writer, index=False)
+            col2.download_button("📥 Baixar Excel", buffer_excel.getvalue(), "amostras.xlsx", key="xlsx_btn")
         except Exception as e:
-            st.warning(f"Erro ao gerar Excel (Verifique o requirements.txt): {e}")
-
+            col2.error(f"Erro no Excel: {e}")
