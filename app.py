@@ -1,4 +1,3 @@
-import streamlit as st
 import pandas as pd
 import geopandas as gpd
 import numpy as np
@@ -6,14 +5,16 @@ from shapely.geometry import Point
 import fiona
 import random
 import io
+import folium
+from streamlit_folium import st_folium
 
 # Habilita drivers KML
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 
 st.set_page_config(page_title="Auditoria Rodoviária", layout="wide")
 
-st.title("🚧 Auditoria: Amostragem com Alternância de Bordos")
-st.markdown("Sequência: **Direito ➔ Eixo ➔ Esquerdo**.")
+st.title("🚧 Auditoria: Amostragem com Mapa Interativo")
+st.markdown("Sequência fixa: **Direito ➔ Eixo ➔ Esquerdo**.")
 
 # --- SIDEBAR ---
 st.sidebar.header("Parâmetros Técnicos")
@@ -37,13 +38,12 @@ def identificar_zonas_curvas(linha, recuo=130):
 
 # --- LÓGICA DE GERAÇÃO ---
 if uploaded_file:
-    # Se o arquivo mudar, limpamos a memória anterior
     if 'last_uploaded' not in st.session_state or st.session_state['last_uploaded'] != uploaded_file.name:
         st.session_state['amostras'] = None
         st.session_state['last_uploaded'] = uploaded_file.name
 
     if st.sidebar.button("Gerar Amostras"):
-        with st.spinner('Processando geometria e sorteando pontos...'):
+        with st.spinner('Calculando pontos e gerando mapa...'):
             gdf = gpd.read_file(uploaded_file, driver='KML')
             utm_gdf = gdf.to_crs(gdf.estimate_utm_crs())
             linha_rodovia = utm_gdf.geometry.iloc[0]
@@ -85,33 +85,47 @@ if uploaded_file:
 
             st.session_state['amostras'] = pd.DataFrame(dados_finais)
 
-    # --- EXIBIÇÃO PERSISTENTE ---
+    # --- EXIBIÇÃO ---
     if st.session_state.get('amostras') is not None:
         df_final = st.session_state['amostras']
         
-        st.success(f"Foram geradas {len(df_final)} amostras.")
+        st.subheader("📋 Tabela de Amostragem")
         st.dataframe(df_final.drop(columns=['geometry', 'crs_origem']), use_container_width=True)
 
-        col1, col2 = st.columns(2)
+        # --- MAPA INTERATIVO ---
+        st.subheader("🗺️ Visualização Espacial")
+        
+        # Centraliza o mapa na média das coordenadas
+        m = folium.Map(location=[df_final.Latitude.mean(), df_final.Longitude.mean()], zoom_start=13, control_scale=True)
+        folium.TileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google', name='Google Satellite').add_to(m)
 
+        cores = {"Bordo Direito": "red", "Eixo": "blue", "Bordo Esquerdo": "green"}
+        
+        for _, row in df_final.iterrows():
+            folium.CircleMarker(
+                location=[row['Latitude'], row['Longitude']],
+                radius=5,
+                color=cores[row['Posição Lateral']],
+                fill=True,
+                fill_opacity=0.7,
+                popup=f"<b>{row['Identificação']}</b><br>{row['Posição Lateral']}<br>{row['Quilometragem']}"
+            ).add_to(m)
+        
+        st_folium(m, width=1200, height=500, returned_objects=[])
+
+        # --- DOWNLOADS ---
+        col1, col2 = st.columns(2)
+        
         # Download KML
-        try:
-            # Reconstroi o GeoDataFrame a partir da memória
-            crs_origem = df_final['crs_origem'].iloc[0]
-            amostras_gdf = gpd.GeoDataFrame(df_final, geometry='geometry', crs=crs_origem).to_crs(epsg=4326)
-            amostras_gdf['Name'] = amostras_gdf['Identificação'] + " - " + amostras_gdf['Posição Lateral']
-            
-            buffer_kml = io.BytesIO()
-            amostras_gdf[['Name', 'geometry']].to_file(buffer_kml, driver='KML')
-            col1.download_button("📥 Baixar KML", buffer_kml.getvalue(), "amostras.kml", key="kml_btn")
-        except Exception as e:
-            col1.error(f"Erro no KML: {e}")
+        crs_origem = df_final['crs_origem'].iloc[0]
+        amostras_gdf = gpd.GeoDataFrame(df_final, geometry='geometry', crs=crs_origem).to_crs(epsg=4326)
+        amostras_gdf['Name'] = amostras_gdf['Identificação'] + " - " + amostras_gdf['Posição Lateral']
+        buffer_kml = io.BytesIO()
+        amostras_gdf[['Name', 'geometry']].to_file(buffer_kml, driver='KML')
+        col1.download_button("📥 Baixar KML", buffer_kml.getvalue(), "amostras.kml", key="kml_btn")
 
         # Download Excel
-        try:
-            buffer_excel = io.BytesIO()
-            with pd.ExcelWriter(buffer_excel, engine='openpyxl') as writer:
-                df_final.drop(columns=['geometry', 'crs_origem']).to_excel(writer, index=False)
-            col2.download_button("📥 Baixar Excel", buffer_excel.getvalue(), "amostras.xlsx", key="xlsx_btn")
-        except Exception as e:
-            col2.error(f"Erro no Excel: {e}")
+        buffer_excel = io.BytesIO()
+        with pd.ExcelWriter(buffer_excel, engine='openpyxl') as writer:
+            df_final.drop(columns=['geometry', 'crs_origem']).to_excel(writer, index=False)
+        col2.download_button("📥 Baixar Excel", buffer_excel.getvalue(), "amostras.xlsx", key="xlsx_btn")
