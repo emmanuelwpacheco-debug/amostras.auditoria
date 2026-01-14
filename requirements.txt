@@ -6,4 +6,4 @@ fiona
 pyproj
 openpyxl
 folium
-st-folium
+streamlit-folium
